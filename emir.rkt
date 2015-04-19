@@ -1,5 +1,12 @@
 #lang racket
-
+(provide deduplicate-rules
+         simplify-formula
+         formula-≡?)
+(require "nauty.rkt"
+         "terms.rkt"
+         data/union-find
+         (only-in unstable/list check-duplicate)
+         ffi/unsafe ffi/cvector)
 #|
 A datalog language with unordered existential quantification.
 
@@ -26,7 +33,7 @@ then the zippers to y and x are conjHole({H(x)}) and conjHole({H(y)}) respective
 
 Phase 1: lift existentials.
 Phase 2: encode formulae as graphs
-Phase 3: Decide 
+Phase 3: Decide
 
 Examples:
 The following three rules are equivalent:
@@ -44,210 +51,23 @@ p1(x) <- H(x),H(y) \/ F(z)
 
 |#
 
-(define intern-table (make-weak-hash))
-(struct formula (key) #:transparent
-        #:methods gen:equal+hash
-        [(define (equal-proc x y rec) (= (formula-key x) (formula-key y)))
-         (define (hash-proc x rec) (rec (formula-key x)))
-         (define (hash2-proc x rec) (rec (formula-key x)))])
-
-;; The formula constructors are structurally ordered as pred < conj < disj < neg < ∃
-(struct pred formula (name terms) #:transparent)
-(struct conj formula (Fs) #:transparent)
-(struct disj formula (Fs) #:transparent)
-(struct neg formula (F) #:transparent)
-(struct ∃ formula (s) #:transparent)
-
-;; Intern if unseen. Return canonical representation if seen.
-(define-syntax-rule (mk-intern name constructor args ...)
-  (define (name args ...)
-    (define clause (list 'constructor args ...))
-    (cond
-     [(hash-has-key? intern-table clause)
-      (hash-ref intern-table clause)]
-     [else
-      (define F (constructor (hash-count intern-table) args ...))
-      (hash-set! intern-table clause F)
-      F])))
-
-(mk-intern *pred pred name terms) ;; terms is a list.
-(mk-intern *conj conj Fs) ;; Fs is a list
-(mk-intern *disj disj Fs) ;; Fs is a list
-(mk-intern *neg neg F)
-(mk-intern *∃ ∃ s)
-
-;; Terms
-(struct BVar (db) #:transparent)
-(struct FVar (name) #:transparent)
-
-(struct Scope (n f) #:transparent)
-
-(define (atom? x)
-  (or (boolean? x) (number? x) (string? x) (symbol? x)))
-
-;; (rule head (Scope n F)) stands for `head(x1,...,xn) <- F.` for some names xi
-(struct rule (head s) #:transparent)
-
-(define (lex ord ls0 ls1)
-  (define n0 (length ts0))
-  (define n1 (length ts1))
-  (or (< n0 n1)
-      (and (= n0 n1)
-           (let lex ([ls0 ls0] [ls1 ls1])
-             (match* (ls0 ls1)
-               [('() '()) #f]
-               [((cons l0 ls0) (cons l1 ls1))
-                (or (ord l0 l1)
-                    (and (equal? l0 l1)
-                         (lex ls0 ls1)))])))))
-
-(define (term<? t0 t1)
-  (match* (t0 t1)
-    [((pred _ m ts0) (pred _ n ts1))
-     (or (symbol<? m n)
-         (and (symbol=? m n)
-              (lex term<? ts0 ts1)))]
-    [((BVar i) (BVar j)) (< i j)]
-    [((FVar x) (FVar y)) (symbol<? x y)]
-    ;; atom < BVar < FVar < pred
-    [(_ (? pred?)) (not (pred? t0))]
-    [((? BVar?) (? FVar?)) #t]
-    [((? atom? a0) _)
-     (if (atom? t1)
-         (atom<? a0 t1)
-         #t)]
-    [(_ _) #f]))
-
-;; pred < ∃ < neg < disj < conj
-(define (formula<? f0 f1)
-  (match* (f0 f1)
-    [((conj _ fs0) (conj _ fs1))
-     ;; don't worry, it's well-founded.
-     (define fs0* (remove-sorted-duplicates (sort fs0 formula<?)))
-     (define fs1* (remove-sorted-duplicates (sort fs1 formula<?)))
-     (lex formula<? fs0* fs1*)]
-    [((disj _ fs0) (disj _ fs1)) (lex formula<? fs0 fs1)]
-    [((neg _ f0) (neg _ f1)) (formula<? f0 f1)]
-    [((∃ _ (and s0 (Scope m F0))) (∃ _ (and s1 (Scope n F1))))
-     (define names (build-list (min m n) (λ _ (FVar (gensym)))))
-     (formula<? (open-scope s0 names) (open-scope s1 names))]
-    [((? pred? p0) (? pred? p1)) (term<? p0 p1)]
-    ;; injection orderings
-    [(_ (? conj?)) #t]
-    [((or (? pred?) (? ∃?) (? neg?)) (? disj?)) #t]
-    [((or (? pred?) (? ∃?)) (? neg?)) #t]
-    [((? pred?) (? ∃?)) #t]
-    [(_ _) #f]))
-
-;; #f < #t < number < string < symbol
-(define (atom<? a0 a1)
-  (cond [(and (symbol? a0) (symbol? a1)) (symbol<? a0 a1)]
-        [(and (string? a0) (string? a1)) (string<? a0 a1)]
-        [(and (number? a0) (number? a1))
-         (cond [(and (real? a0) (real? a1)) (< a0 a1)]
-               [(real? a0) #t]
-               [(real? a1) #f]
-               [else (or (< (real-part a0) (real-part a1))
-                         (and (= (real-part a0) (real-part a1))
-                              (< (imag-part a0) (imag-part a1))))])]
-        [(and (boolean? a0) (boolean? a1))
-         (not (or (equal? a0 a1) a0))]
-        [(symbol? a1) (not (symbol? a0))]
-        [(string? a1) (or (boolean? a0) (number? a0))]
-        [(number? a1) (boolean? a0)]
-        [else #f]))
-
-;; Formula -> Setof Symbol
-(define (formula-free f)
-  (match f
-    [(? pred? p) (term-free p)]
-    [(conj _ Fs) (for/union ([F (in-list Fs)]) (formula-free F))]
-    [(disj _ Fs) (for/union ([F (in-list Fs)]) (formula-free F))]
-    [(neg _ F) (formula-free F)]
-    [(∃ _ (Scope _ F)) (formula-free F)]
-    [_ (error 'formula-free "Bad formula ~a" f)]))
-
-(define ∅ (seteq))
-
-;; Term -> Setof Symbol
-(define (term-free t)
-  (match t
-    [(pred _ _ ts) (for/union ([t (in-list ts)]) (term-free ts))]
-    [(FVar x) (seteq x)]
-    [(or (? BVar?) (? atom?)) ∅]
-    [_ (error 'term-free "Bad term ~a" t)]))
-
-;; Ideally, we want to canonicalize the set->list operation based on some
-;; well-behaved criteria.
-(define (close-∃ names f) (*∃ (abstract-names (set->list names) 0 f)))
-
-;; If name in names, replace by (BVar <index in list>+i)
-;; Otherwise return #f
-(define (abstract-by name names i)
-  (match names
-    [(cons name* names*)
-     (if (equal? name name*)
-         (BVar i)
-         (abstract-by name names* (add1 i)))]
-    [_ #f]))
-
-;; Replace names by deBruijn indices starting at i, offset by position in list.
-(define (abstract-names names i f)
-  (let abs ([f f] [i i])
-    (match f
-      [(? pred? p) (abstract-names-in-term names i p)]
-      [(conj _ Fs) (*conj (for/list ([F (in-list Fs)]) (abs F i)))]
-      [(disj _ Fs) (*disj (for/list ([F (in-list Fs)]) (abs F i)))]
-      [(neg _ F) (*neq (abs F i))]
-      [(∃ _ (Scope n F)) (*∃ (Scope n (abs F (+ i n))))]
-      [_ (error 'abstract-names "Bad formula ~a" f)])))
-
-(define (abstract-names-in-term names i t)
-  (let self ([t t])
-    (match t
-      [(FVar x) (or (abstract-by x names i) t)]
-      [(pred _ name ts) (*pred name (map self ts))]
-      [(or (? BVar?) (? atom?)) t]
-      [_ (error 'abstract-names-in-term "Bad term ~a" t)])))
-
-(define (open-scope S terms)
-  (match-define (Scope n F) S)
-  (define num (length terms))
-  (when (> num n) (error 'open-scope "Scope has ~a binders, but given ~a substitutions" n num))
-  ;; It's possible the scope is too big and will never try to instantiate past the size of terms.
-  (when (< num n)
-    (log-info (format
-               "open-scope called with fewer substitutions (~a) than binders (~a)."
-               num n)))
-  (let open ([f F] [i 0])
-    (match f
-      [(? pred? p) (subst-indices-in-term terms i p)]
-      [(conj _ Fs) (*conj (for/list ([F (in-list Fs)]) (open F i)))]
-      [(disj _ Fs) (*disj (for/list ([F (in-list Fs)]) (open F i)))]
-      [(neg _ F) (*neq (open F i))]
-      [(∃ _ (Scope n F)) (*∃ (Scope n (open F (+ i n))))]
-      [_ (error 'open-scope "Bad formula ~a" f)])))
-
-(define (subst-indices-in-term terms i p)
-  (let self ([t t])
-    (match t
-      [(BVar i*)
-       (define index (- i* i))
-       (if (< index 0)
-           t
-           (let find ([terms terms] [ind index])
-             (match terms
-               [(cons t terms) (if (= 0 ind) t (find terms (sub1 ind)))]
-               ;; none left
-               [_ t])))]
-      [(pred _ name ts) (*pred name (map self ts))]
-      [(or (? FVar?) (? atom?)) t]
-      [_ (error 'abstract-names-in-term "Bad term ~a" t)])))
+;; From paper:
+;; frontier_f(t) = { frontier_f(a1) @ ... @ frontier_f(an) if t ≡ f(a1,...,an)
+;;                   [t] otherwise
+;; However we only have binary constructors: conj and disj.
+(define (bin-frontier pred? left right)
+  (define (self t)
+    (if (pred? t)
+        (append (self (left t)) (self (right t)))
+        (list t)))
+  self)
+(define conj-frontier (bin-frontier conj? conj-f0 conj-f1))
+(define disj-frontier (bin-frontier disj? disj-f0 disj-f1))
 
 ;; Formula (Setof Symbol) -> Formula
 ;; Given a top-level formula, add existential quantification at either the top level,
 ;; or immediately under a negation, of free names and explicitly bound existentials.
-(define (lift-existentials f bound)
+(define (lift-existentials f [bound ∅])
   (define-values (f* names) (splat-existentials f bound))
   (close-∃ names f*))
 
@@ -255,26 +75,379 @@ p1(x) <- H(x),H(y) \/ F(z)
 (define (splat-existentials f bound)
   (match f
     [(? pred? p) (values p (set-subtract (term-free p) bound))]
-    [(conj _ Fs)
-     (define-values (rev-Fs* names)
-       (for/fold ([rev-Fs* '()] [names ∅]) ([F (in-list Fs)])
-         (define-values (F* names*)
-           (splat-existentials F (set-union bound names)))
-         (values (cons F* rev-Fs*) (set-union names names*))))
-     (values (*conj (reverse rev-Fs*)) names)]
-    [(disj _ Fs)
-     (define-values (rev-Fs* names)
-       (for/fold ([rev-Fs* '()] [names ∅]) ([F (in-list Fs)])
-         (define-values (F* names*)
-           (splat-existentials F (set-union bound names)))
-         (values (cons F* rev-Fs*) (set-union names names*))))
-     (values (*disj (reverse Fs*)) names)]
+    [(or (and (conj f0 f1) (app (λ _ conj) mk))
+         (and (disj f0 f1) (app (λ _ disj) mk)))
+     (define-values (f0* names) (splat-existentials f0 bound))
+     (define-values (f1* names*) (splat-existentials f1 (set-union bound names)))
+     (values (mk f0* f1*) (set-union names names*))]
     ;; negations don't leak any splatted existentials, but any free variables are lifted.
-    [(neg _ F)
+    [(neg F)
      (define names (formula-free F))
-     (values (*neg (lift-existentials F (set-union bound names))) names)]
-    [(∃ _ (and s (Scope n F)))
-     (define names (make-names n (set-union bound (formula-free F))))
+     (values (neg (lift-existentials F (set-union bound names))) names)]
+    [(∃ (and s (Scope F)))
+     (define name (variable-not-in (set-union bound (formula-free F))))
      (define-values (F* names*)
-       (splat-existentials (open-scope S names) (set-union bound names)))
-     (values F* (set-union names names*))]))
+       (splat-existentials (open-scope s (FVar name)) (set-add bound name)))
+     (values F* (set-add names* name))]
+    [_ (error 'splat-existentials "Bad formula: ~a" f)]))
+
+(define (right-associate bin lst)
+  (let self ([L lst])
+    (match L
+      [(list a) a]
+      [(cons a more)
+       (bin a (right-associate bin more))]
+      ['() (error 'right-associate "Empty list illegal: ~a" bin)])))
+
+(define (simplify-formula f [uf #hasheq()])
+  (let self ([f f])
+    (match f
+      [(pred head ts)
+       (match (hash-ref uf head #f)
+         [#f f]
+         ;; Use the equivalence class's representative for a given predicate
+         [ufs (pred (uf-find ufs) ts)])]
+      [(? conj?) ;; remove any equivalent formulae
+       (right-associate conj (deduplicate (map self (conj-frontier f))))]
+      [(? disj?)
+       (right-associate disj (deduplicate (map self (disj-frontier f))))]
+      [(neg (neg F)) (self F)] ;; XXX: not sure if DNE is valid in datalog.
+      [(neg F) (neg (self F))]
+      [(? ∃?)
+       (define-values (names f*) (open-existentials f))
+       (close-∃ names (self f*))]
+      [_ (error 'simplify-formula "Bad formula: ~a" f)])))
+
+(define (deduplicate-rules rs)
+  (error 'the-ultimate-goal))
+
+;; Use graph isomorphism to determine identity. Can be optimized to do
+;; lighter weight analysis before going to nauty.
+(define (deduplicate lst)
+  (match lst
+    [(list a) lst]
+    [(cons a more)
+     (define lst* (deduplicate more))
+     (if (for/or ([b (in-list lst*)]) (formula-≡? a b))
+         lst*
+         (cons a lst*))]
+    ['() (error 'deduplicate "Empty list")]))
+
+;; Formulae can be interned, and free names canonically chosen,
+;; to speed up easy equivalence problems.
+(define (formula-≡? f0 f1)
+  (or (equal? f0 f1)
+      (LDGs-isomorphic? (formula->LDG f0) (formula->LDG f1))))
+
+;; Create the labeled, directed graph that we will compare for isomorphism
+(struct LDnode (label) #:mutable)
+(struct LDedge (label node-pointer) #:mutable)
+;; A labeled directed graph is a
+;; Hasheq[LDnode,List[LDedge]]
+(define (formula->LDG f)
+  (define G (make-hasheq))
+
+  (define (mk-LDnode label)
+    (define n (LDnode label))
+    (hash-set! G n '())
+    n)
+
+  ;; find all nodes `n` labeled with (FVar x) where `x` in domain of subst.
+  ;; Add a directed edge from subst(x) to `n`, and unlabel `n`.
+  (define (link-and-unlabel! root subst)
+    (define seen (mutable-seteq))
+    (let go ([n root])
+      (unless (set-member? seen n)
+        (set-add! seen n)
+        (match (LDnode-label n)
+          [(FVar x) ;; n is a reference node.
+           (match (hash-ref subst x #f)
+             [#f (void)]
+             ;; x has a binder node we must link up.
+             [binder-n
+              (hash-set! G binder-n
+                         (cons (LDedge #f n) (hash-ref G binder-n)))
+              ;; Binder edge added, so the reference is closed.
+              (set-LDnode-label! n #f)])]
+          [_ (void)])
+        (for-each (compose go LDedge-node-pointer) (hash-ref G n '())))))
+
+  ;; drop the root node on the ground. We don't need it.
+  (let self ([f f])
+    ;; Create and link subgraphs of formula and return root node of subgraph.
+    (match f
+      [(pred head ts)
+       (define n (LDnode head))
+       (hash-set! G n (for/list ([t (in-list ts)]
+                                  [i (in-naturals)])
+                        (LDedge i (mk-LDnode t))))
+       n]
+      ;; Associative and commutative
+      [(? conj? f)
+       (define n (LDnode 'and))
+       (hash-set! G n (for/list ([t (in-list (conj-frontier f))])
+                        (LDedge #f (self t))))
+       n]
+      ;; Associative
+      [(? disj? f)
+       (define n (LDnode 'or))
+       (hash-set! G n (for/list ([t (in-list (disj-frontier f))]
+                                 [i (in-naturals)])
+                        (LDedge i (self t))))
+       n]
+      [(neg F)
+       (define n (LDnode 'neg))
+       (hash-set! G n (list (LDedge 0 (self F))))
+       n]
+      [(? ∃?)
+       ;; Open all existentials for associativity.
+       (define-values (names opened) (open-existentials f))
+       (define n (LDnode '∃))
+       (define name-nodes (for/list ([_ (in-list names)]) (mk-LDnode #f)))
+       (define subst (for/hasheq ([name (in-list names)]
+                                  [n (in-list name-nodes)])
+                       (values name n)))
+       (define subgraph (self opened))
+       (link-and-unlabel! subgraph subst)
+       (hash-set! G n (cons (LDedge #f subgraph)
+                            (for/list ([nn (in-list name-nodes)])
+                              ;; unordered for commutivity
+                              (LDedge #f nn))))
+       n]
+      [_ (error 'formula->LDG "Bad formula: ~a" f)]))
+  G)
+
+;; #f < symbol < (FVar x) < (Const #f) < (Const #t) < (Const number) < (Const string) < (Const symbol)
+;; XXX: consider moving this to terms for a more canonical interning strategy.
+(define (atom<? a0 a1)
+  (match* (a0 a1)
+    [((Const a0) (Const a1))
+     (cond [(and (symbol? a0) (symbol? a1)) (symbol<? a0 a1)]
+           [(and (string? a0) (string? a1)) (string<? a0 a1)]
+           [(and (number? a0) (number? a1))
+            (cond [(and (real? a0) (real? a1)) (< a0 a1)]
+                  [(real? a0) #t]
+                  [(real? a1) #f]
+                  [else (or (< (real-part a0) (real-part a1))
+                            (and (= (real-part a0) (real-part a1))
+                                 (< (imag-part a0) (imag-part a1))))])]
+           [(and (boolean? a0) (boolean? a1))
+            (not (or (equal? a0 a1) a0))]
+           [(symbol? a1) (not (symbol? a0))]
+           [(string? a1) (or (boolean? a0) (number? a0))]
+           [(number? a1) (boolean? a0)]
+           [else #f])]
+    [((FVar x) (FVar y)) (symbol<? x y)]
+    [((? FVar?) (? Const?)) #t]
+    [((? symbol?) _)
+     (if (symbol? a1)
+         (symbol<? a0 a1)
+         (or (FVar? a1) (Const? a1)))]
+    [(#f (not #f)) #t]
+    [(_ _) #f]))
+
+(define (opreal<? or0 or1)
+  (if (and (real? or0) (real? or1))
+      (< or0 or1)
+      (and (not or0) or1)))
+
+(define (same-labels? G0 G1)
+  (define (vertex-labels G)
+    (map LDnode-label (hash-keys G)))
+  (define (edge-labels G)
+    (map LDedge-label (append* (hash-values G))))
+  (and (equal? (sort (vertex-labels G0) atom<?)
+               (sort (vertex-labels G1) atom<?))
+       (equal? (sort (edge-labels G0) opreal<?)
+               (sort (edge-labels G1) opreal<?))))
+
+;; A directed graph is a Hash[ℕ,[Set[ℕ]]]
+;; We assign numbers to LDnode by pointer equality
+(define (identify G)
+  (for/hasheq ([n (in-hash-keys G)]
+               [i (in-naturals)])
+    (values n i)))
+
+;; Return Hash[LDnode,ℕ+] counting the number of edges to particular nodes.
+(define (edge-multiplicity lst)
+  (define M (make-hasheq))
+  (for ([e (in-list lst)])
+    (match-define (LDedge _ n) e)
+    (hash-set! M n (add1 (hash-ref M n 0))))
+  M)
+
+#|
+ For any two nodes that have multiple edges between them, add breaker nodes.
+   ___________              _____._____
+  /           \            /           \
+* ------------- *   ==>  * ------•------ *
+  \___________/            \_____._____/
+
+|#
+(define (LDG->DG LDG)
+  (define I (identify LDG))
+  (define DG (make-hash))
+  (for ([i (in-hash-values I)])
+    (hash-set! DG i (set)))
+  (for* ([(n es) (in-hash LDG)]
+         [ni (in-value (hash-ref I n))]
+         [(n* mult) (in-hash (edge-multiplicity es))]
+         [n*i (in-value (hash-ref I n*))])
+    (cond [(> mult 1)
+           ;; hash-count is the next node number, so the interval
+           ;; [hash-count,hash-count+mult)
+           ;; is the next range of node indices to use.
+           (define end (hash-count DG))
+           (for ([j (in-range mult)]
+                 [idx (in-naturals end)])
+             (hash-set! DG ni (set-add (hash-ref DG ni) idx))
+             (hash-set! DG idx (set-add (hash-ref DG idx) n*i)))]
+          [else
+           (hash-set! DG ni (set-add (hash-ref DG ni) n*i))]))
+  DG)
+
+(define (LDGs-isomorphic? G0 G1)
+  (and (same-labels? G0 G1)
+       (adjs-isomorphic? (LDG->DG G0) (LDG->DG G1))))
+
+#|
+Directed graph to undirected graph widget:
+                             . m2
+                             |
+* ---> *    ==>  * --- * --- * --- *
+n      n*        n     m0    m1    n*
+
+This code is only necessary if it turns out nauty digraph canonicalization is buggy.
+The file interface to nauty is undirected only, so there might be cause to worry.
+It's better to not blow graphs up a factor of 4, so I use directed graphs for now.
+
+|#
+(define (DG->UG DG)
+  (define UG (make-hash))
+  (for ([i (in-hash-keys DG)])
+    (hash-set! UG i (set)))
+  (define (diedge! i j)
+    (hash-set! UG i (set-add (hash-ref UG i (set)) j)))
+  (define (edge! i j)
+    (diedge! i j)
+    (diedge! j i))
+  (for* ([(n S) (in-hash DG)]
+         [n* (in-set S)])
+    (define m0 (hash-count UG))
+    (define m1 (+ 1 m0))
+    (define m2 (+ 1 m1))
+    (edge! n m0)
+    (edge! m0 m1)
+    (edge! m1 n*)
+    (edge! m1 m2))
+  UG)
+
+(define (DGs-isomorphic? G0 G1)
+  (adjs-isomorphic? (DG->UG G0) (DG->UG G1)))
+
+(module+ test
+  (require rackunit)
+
+  #|
+  A little parser for an s-expression form of the formulas and rules.
+  |#
+
+  (define (sexp->term sexp)
+    (match sexp
+      [(? symbol? x) (FVar x)]
+      [(or `(quote ,(? atom? a))
+           (? atom? a)) (Const a)]
+      [_ (error 'sexp->term "Bad term: ~a" sexp)]))
+
+  (define (sexp->formula sexp)
+    (define ((is-named lst) x) (memq x lst))
+    (define (self sexp)
+      (match sexp
+        [`(,(? (is-named '(and ∧))) ,fs ...)
+         (right-associate conj (map self fs))]
+        [`(,(? (is-named '(or ∨))) ,fs ...)
+         (right-associate disj (map self fs))]
+        [`(,(? (is-named '(exists ∃))) (,(? symbol? evar) ...) ,f)
+         (define dup (check-duplicate evar))
+         (when dup (error 'sexp->formula "Duplicate binder in formula: ~a" dup))
+         (close-∃ evar (self f))]
+        [`(,(? (is-named '(not ¬))) ,f) (neg (self f))]
+        [`(,(? symbol? head) ,terms ...)
+         (pred head (map sexp->term terms))]))
+    (self sexp))
+
+  (define (sexp->rule sexp)
+    (match sexp
+      [`((,(? symbol? head) ,(? symbol? formal) ...) <- ,F)
+       (define dup (check-duplicate formal))
+       (when dup (error 'sexp->rule "Duplicate binder in rule: ~a" dup))
+       (rule head (for/fold ([s (sexp->formula F (apply seteq formal))])
+                      ([name (in-list formal)])
+                    (abstract-name name 0 s)))]))
+
+  (check equal?
+         ;; Rule (foo x y) <- (H x), (G y), (P y z)
+         (lift-existentials (sexp->formula `(and (H x) (G y) (P y z)))
+                            (seteq 'x 'y))
+         (sexp->formula `(∃ (z) (and (H x) (G y) (P y z)))))
+
+  (check equal?
+         ;; Rule (foo x y) <- (H x), (∃ (w) (G y w)), (∃ (w) (P y z w))
+         (lift-existentials (sexp->formula
+                             `(and (H x)
+                                   (∃ (w) (G y w))
+                                   (∃ (w) (P y z w))))
+                            (seteq 'x 'y))
+         (sexp->formula `(∃ (z w0 w1) (and (H x) (G y w0) (P y z w1))))))
+
+(define (fill-from! cv M start)
+  (for ([idx (in-range M)]
+        [n (in-naturals start)])
+    (cvector-set! cv idx n)))
+
+;; G is an adjacency mapping.
+(define (adj->nauty-graph G num-vertices m)
+  (nauty_check WORDSIZE num-vertices m NAUTYVERSIONID)
+
+  (define g (make-cvector setword (* num-vertices m)))
+
+  (EMPTYSET0 g (* num-vertices m))
+  (for* ([(node adj) (in-hash G)]
+         [neighbor (in-set adj)])
+    (ADDONEARC g node neighbor m))
+
+  g)
+
+(define (nauty-canonicalize g num-vertices m)
+  (define lab1 (make-cvector _int num-vertices))
+  (define ptn (make-cvector _int num-vertices))
+  (define orbits (make-cvector _int num-vertices))
+  (define cg (make-cvector setword (* num-vertices m)))
+  (EMPTYSET0 cg (* num-vertices m)) 
+
+  (liason g lab1 ptn orbits m num-vertices cg)
+  cg)
+
+(define (adjs-isomorphic? G0 G1)
+  (define num-vertices (hash-count G0))
+  (cond
+   [(= num-vertices (hash-count G1))
+    (define m (SETWORDSNEEDED num-vertices))
+    (define NG0 (adj->nauty-graph G0 num-vertices m))
+    (define NG1 (adj->nauty-graph G1 num-vertices m))
+    (define ngc0 (nauty-canonicalize NG0 num-vertices m))
+    (define ngc1 (nauty-canonicalize NG1 num-vertices m))
+    (dense_compare ngc0 ngc1 num-vertices m)]
+   [else #f]))
+
+(module+ test
+  (check formula-≡?
+         ;; Rule (foo x y) <- (H x), (∃ (w) (G y w)), (∃ (w) (P y z w))
+         (sexp->formula `(∃ (z w0 w1) (and (H x) (G y w0) (P y z w))))
+         (sexp->formula `(∃ (w0 z w1) (and (G y w0) (P y z w) (H x))))
+        )
+
+  (check formula-≡?
+         (simplify-formula
+          (sexp->formula `(∃ (w0 z w1) (and (G y w0) (G y w0) (P y z w) (H x) (P y z w)))))
+         (sexp->formula `(∃ (w0 w1 z) (and (G y w0) (P y z w) (H x))))))
