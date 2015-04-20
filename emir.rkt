@@ -133,46 +133,69 @@ p1(x) <- H(x),H(y) \/ F(z)
   (define found-union? #f)
   (define uf-map (make-hasheq))
   ;; Create equivalence classes for predicates
-  (for ([r (in-list rs)])
-    (define head (rule-head r))
-    (when (hash-has-key? uf-map head)
-      (error 'deduplicate-rules "Duplicate predicate definition: ~a" head))
-    (hash-set! uf-map head (uf-new head)))
+  ;; Open all the scopes and lift all existentials
+  (define-values (binders open-rules)
+    (for/lists (namess rules) ([r (in-list rs)])
+      (match-define (rule head arity f) r)
+      (when (hash-has-key? uf-map head)
+        (error 'deduplicate-rules "Duplicate predicate definition: ~a" head))
+      (hash-set! uf-map head (uf-new head))
 
-  (define (dedup rs)
-    (match rs
-      ['() '()]
-      [(list r) rs]
-      [(cons r rs*)
-       (define drs (dedup rs*))
+      (define-values (rev-names f*) (open-scopes f))
+      (values rev-names
+              (rule head arity
+                    (lift-existentials f* (apply seteq rev-names))))))
+
+
+  (define (dedup binders rs)
+    (match* (binders rs)
+      [('() '()) (values '() '())]
+      [((list name) (list r)) (values binders rs)]
+      [((cons rev-names binders*) (cons r rs*))
+       (define-values (dbinders drs) (dedup binders* rs*))
        (match (compare-and-reduce r drs)
-         [#f (cons (simplify-rule r uf-map) drs)]
+         [#f (values (cons rev-names dbinders)
+                     (cons (simplify-rule r uf-map) drs))]
          [same
           (uf-union! (hash-ref uf-map (rule-head r))
                      (hash-ref uf-map same))
           (set! found-union? #t)
-          (cons (simplify-rule r uf-map) drs)])]))
+          (values dbinders drs)])]))
 
   ;; Simplify until no more equivalent rules are found.
-  (let go ([rs rs])
-    (define rs* (dedup rs))
+  (let go ([binders binders] [rs open-rules])
+    (define-values (names* rs*) (dedup binders rs))
     (if found-union?
         (begin (set! found-union? #f)
-               (go rs*))
-        rs*)))
+               (go names* rs*))
+        ;; Done. Close them all up.
+        (for/list ([r (in-list rs*)]
+                   [rev-names (in-list names*)])
+          (match-define (rule head arity f) r)
+          (rule head arity (abstract-names rev-names f))))))
 
 ;; At most one rule of rs can be equivalent since rs is deduped already.
 (define (compare-and-reduce r rs)
   (match-define (rule _ arity f) r)
-  (define of (open-scopes f))
-  (let search ([rs rs])
-   (match rs
-     ['() #f]
-     [(cons (rule head arity* f*) rs)
-      (if (and (= arity arity*)
-               (formula-≡? of (open-scopes f*)))
-          head
-          (search rs))])))
+  (for/or ([r* (in-list rs)])
+    (open-rules-equivalent?-aux arity f r*)))
+
+(define (rules-equivalent? r0 r1)
+  (define (open-rule r)
+    (match-define (rule head arity s) r)
+    (define-values (names f) (open-scopes s))
+    (rule head arity (lift-existentials f (apply seteq names))))
+  (match-define (rule _ arity f) r0)
+  
+  (open-rules-equivalent?-aux (rule-arity r0)
+                              (rule-s (open-rule r0))
+                              (open-rule r1)))
+
+(define (open-rules-equivalent?-aux arity of open-rule)
+  (match-define (rule head arity* f) open-rule)
+  (and (= arity arity*)
+       (lifted-formula-≡? of f)
+       head))
 
 ;; Use graph isomorphism to determine identity. Can be optimized to do
 ;; lighter weight analysis before going to nauty.
@@ -190,10 +213,13 @@ p1(x) <- H(x),H(y) \/ F(z)
 ;; to speed up easy equivalence problems.
 (define (formula-≡? f0 f1 [bound ∅])
   (or (equal? f0 f1)
-      (let ([f0* (lift-existentials f0 bound)]
-            [f1* (lift-existentials f1 bound)])
-        (or (equal? f0* f1*)
-            (LDGs-isomorphic? (formula->LDG f0*) (formula->LDG f1*))))))
+      (lifted-formula-≡?
+                       (lift-existentials f0 bound)
+                       (lift-existentials f1 bound))))
+
+(define (lifted-formula-≡? f0 f1)
+  (or (equal? f0 f1)
+      (LDGs-isomorphic? (formula->LDG f0) (formula->LDG f1))))
 
 ;; Create the labeled, directed graph that we will compare for isomorphism
 (struct LDnode (label) #:mutable)
@@ -439,7 +465,7 @@ It's better to not blow graphs up a factor of 4, so I use directed graphs for no
        (when dup (error 'sexp->rule "Duplicate binder in rule: ~a" dup))
        (rule head
              (length formal)
-             (for/fold ([s (sexp->formula F (apply seteq formal))])
+             (for/fold ([s (sexp->formula F)])
                  ([name (in-list formal)])
                (abstract-name name s)))]))
 
@@ -476,7 +502,7 @@ It's better to not blow graphs up a factor of 4, so I use directed graphs for no
   (define ptn (make-cvector _int num-vertices))
   (define orbits (make-cvector _int num-vertices))
   (define cg (make-cvector setword (* num-vertices m)))
-  (EMPTYSET0 cg (* num-vertices m)) 
+  (EMPTYSET0 cg (* num-vertices m))
 
   (liason g lab1 ptn orbits m num-vertices cg)
   cg)
@@ -494,13 +520,30 @@ It's better to not blow graphs up a factor of 4, so I use directed graphs for no
    [else #f]))
 
 (module+ test
-  (check formula-≡?
+  (check (λ (x y) (formula-≡? x y (seteq 'x 'y)))
          ;; Rule (foo x y) <- (H x), (∃ (w) (G y w)), (∃ (w) (P y z w))
-         (sexp->formula `(∃ (z w0 w1) (and (H x) (G y w0) (P y z w))))
-         (sexp->formula `(∃ (w0 z w1) (and (G y w0) (P y z w) (H x))))
+         (sexp->formula `(∃ (z w0 w1) (and (H x) (G y w0) (P y z w1))))
+         (sexp->formula `(∃ (w0 z w1) (and (G y w0) (P y z w1) (H x))))
         )
 
-  (check formula-≡?
+  (check (λ (x y) (formula-≡? x y (seteq 'y 'x)))
          (simplify-formula
-          (sexp->formula `(∃ (w0 z w1) (and (G y w0) (G y w0) (P y z w) (H x) (P y z w)))))
-         (sexp->formula `(∃ (w0 w1 z) (and (G y w0) (P y z w) (H x))))))
+          (sexp->formula `(∃ (w0 z w1) (and (G y w0) (G y w0) (P y z w1) (H x) (P y z w1)))))
+         (sexp->formula `(∃ (w0 w1 z) (and (G y w0) (P y z w1) (H x)))))
+
+
+  (define rules
+    (deduplicate-rules
+     (list (sexp->rule `((p1 x) <- (and (∃ (y) (H x y)) (∃ (z) (G x z)))))
+           (sexp->rule `((p2 x) <- (and (G x z) (H x y)))))))
+  (check-true (and (pair? rules) (null? (cdr rules))) "Dedup rules")
+  (check rules-equivalent?
+         (car rules)
+         (sexp->rule `((pred w) <- (and (H w y) (G w z)))))
+
+  (check (λ (x y) (not (formula-≡? x y)))
+         (sexp->formula `(and (∃ (x) (H x))
+                              (∃ (y) (G y))))
+         (sexp->formula `(∃ (x) (and (H x) (G x)))))
+
+)

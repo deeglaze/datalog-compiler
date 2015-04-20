@@ -156,8 +156,13 @@ Name manipulation is provided.
 ;; Ideally, we want to canonicalize the set->list operation based on some
 ;; well-behaved criteria.
 (define (close-∃ names f)
+  (define free (formula-free f))
   (for/fold ([f f]) ([name (in-set names)])
-    (∃ (abstract-name name f))))
+    ;; Don't bind if irrelevant.
+    ;; This is necessary to allow (∃ (x y) (H x)) ≡ (∃ (y) (H y))
+    (if (set-member? free name)
+        (∃ (abstract-name name f))
+        f)))
 
 (define (open-existentials f)
   (match f
