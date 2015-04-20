@@ -223,7 +223,7 @@
                                 _numcells _int64 _int64 _int64 _int64 _int64
                                 -> _void))
 (define-nauty isautom _isautom+)
-;;(define-nauty dispatch_graph _dispatchvec)
+(define-nauty dispatch_graph _dispatchvec)
 ;; Writes to the character array
 (define-nauty itos (_fun _int64 _pointer -> _int64))
 ;; first pointer is read-only array

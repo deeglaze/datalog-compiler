@@ -32,6 +32,9 @@ Name manipulation is provided.
  subst-indices-in-term
  ;; Helpers
  variable-not-in
+ abstract-names
+ open-scopes
+ num-scopes
  close-∃
  open-existentials)
 (require racket/match racket/set)
@@ -60,7 +63,7 @@ Name manipulation is provided.
   (or (boolean? x) (number? x) (string? x) (symbol? x)))
 
 ;; (rule head (Scope n F)) stands for `head(x1,...,xn) <- F.` for some names xi
-(struct rule (head s) #:transparent)
+(struct rule (head arity s) #:transparent)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Free variables
@@ -74,6 +77,7 @@ Name manipulation is provided.
     [(or (conj f0 f1) (disj f0 f1)) (set-union (formula-free f0) (formula-free f1))]
     [(neg F) (formula-free F)]
     [(∃ (Scope F)) (formula-free F)]
+    [(Scope F) (formula-free F)]
     [_ (error 'formula-free "Bad formula ~a" f)]))
 
 ;; Term -> Setof Symbol
@@ -88,7 +92,12 @@ Name manipulation is provided.
 ;; Locally nameless operations
 
 ;; Replace names by deBruijn indices starting at i, offset by position in list.
-(define (abstract-name name i f)
+(define (abstract-name name f) (abstract-name-aux name 0 f))
+(define (abstract-names names f)
+  (for/fold ([f f]) ([name (in-list names)])
+    (abstract-name name f)))
+
+(define (abstract-name-aux name i f)
   (Scope
    (let abs ([f f] [i i])
      (match f
@@ -96,7 +105,8 @@ Name manipulation is provided.
        [(conj f0 f1) (conj (abs f0 i) (abs f1 i))]
        [(disj f0 f1) (disj (abs f0 i) (abs f1 i))]
        [(neg F) (neg (abs F i))]
-       [(∃ (Scope F)) (∃ (Scope (abs F (add1 i))))]
+       [(∃ s) (∃ (abs s i))]
+       [(Scope F) (Scope (abs F (add1 i)))]
        [_ (error 'abstract-names "Bad formula ~a" f)]))))
 
 (define (abstract-names-in-term name i t)
@@ -107,15 +117,18 @@ Name manipulation is provided.
       [(or (? BVar?) (? Const?)) t]
       [_ (error 'abstract-names-in-term "Bad term ~a" t)])))
 
-(define (open-scope S term)
+(define (open-scope S term) (open-scope-aux S term 0))
+
+(define (open-scope-aux S term i)
   (match-define (Scope F) S)
-  (let open ([f F] [i 0])
+  (let open ([f F] [i i])
     (match f
       [(? pred? p) (subst-indices-in-term term i p)]
       [(conj f0 f1) (conj (open f0 i) (open f1 i))]
       [(disj f0 f1) (disj (open f0 i) (open f1 i))]
       [(neg F) (neg (open F i))]
-      [(∃ (Scope F)) (∃ (Scope (open F (add1 i))))]
+      [(∃ s) (∃ (open s i))]
+      [(Scope F) (Scope (open F (add1 i)))]
       [_ (error 'open-scope "Bad formula ~a" f)])))
 
 (define (subst-indices-in-term term i p)
@@ -144,7 +157,7 @@ Name manipulation is provided.
 ;; well-behaved criteria.
 (define (close-∃ names f)
   (for/fold ([f f]) ([name (in-set names)])
-    (∃ (abstract-name name 0 f))))
+    (∃ (abstract-name name f))))
 
 (define (open-existentials f)
   (match f
@@ -153,3 +166,19 @@ Name manipulation is provided.
      (define-values (names f*) (open-existentials (open-scope s (FVar n))))
      (values (cons n names) f*)]
     [_ (values '() f)]))
+
+;; like open-existentials, but for the top level formulae.
+(define (open-scopes s)
+  (let open ([s s] [rev-names '()])
+    (cond
+     [(Scope? s)
+      (define name (variable-not-in (formula-free s)))
+      (open (open-scope s (FVar name)) (cons name rev-names))]
+     [else
+      (values rev-names s)])))
+
+(define (num-scopes s)
+  (let count ([s s] [num 0])
+    (match s
+    [(Scope f) (count f (add1 num))]
+    [_ num])))

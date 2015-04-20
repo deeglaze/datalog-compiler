@@ -104,9 +104,9 @@ p1(x) <- H(x),H(y) \/ F(z)
     (match f
       [(pred head ts)
        (match (hash-ref uf head #f)
-         [#f f]
          ;; Use the equivalence class's representative for a given predicate
-         [ufs (pred (uf-find ufs) ts)])]
+         [(? uf-set? s) (pred (uf-find s) ts)]
+         [_ f])]
       [(? conj?) ;; remove any equivalent formulae
        (right-associate conj (deduplicate (map self (conj-frontier f))))]
       [(? disj?)
@@ -118,8 +118,61 @@ p1(x) <- H(x),H(y) \/ F(z)
        (close-∃ names (self f*))]
       [_ (error 'simplify-formula "Bad formula: ~a" f)])))
 
+(define (simplify-rule r [uf #hasheq()])
+  (match-define (rule head arity s) r)
+  (define-values (rev-names f) (open-scopes s))
+  (define head*
+    (match (hash-ref uf head #f)
+      [(? uf-set? s) (uf-find s)]
+      [_ head]))
+  (rule head* arity (abstract-names rev-names (simplify-formula f uf))))
+
+;; This is the top level rule grinder. We find pairs of equivalent predicates,
+;; union them, and continue to simplify until all simplifications yield equivalent results.
 (define (deduplicate-rules rs)
-  (error 'the-ultimate-goal))
+  (define found-union? #f)
+  (define uf-map (make-hasheq))
+  ;; Create equivalence classes for predicates
+  (for ([r (in-list rs)])
+    (define head (rule-head r))
+    (when (hash-has-key? uf-map head)
+      (error 'deduplicate-rules "Duplicate predicate definition: ~a" head))
+    (hash-set! uf-map head (uf-new head)))
+
+  (define (dedup rs)
+    (match rs
+      ['() '()]
+      [(list r) rs]
+      [(cons r rs*)
+       (define drs (dedup rs*))
+       (match (compare-and-reduce r drs)
+         [#f (cons (simplify-rule r uf-map) drs)]
+         [same
+          (uf-union! (hash-ref uf-map (rule-head r))
+                     (hash-ref uf-map same))
+          (set! found-union? #t)
+          (cons (simplify-rule r uf-map) drs)])]))
+
+  ;; Simplify until no more equivalent rules are found.
+  (let go ([rs rs])
+    (define rs* (dedup rs))
+    (if found-union?
+        (begin (set! found-union? #f)
+               (go rs*))
+        rs*)))
+
+;; At most one rule of rs can be equivalent since rs is deduped already.
+(define (compare-and-reduce r rs)
+  (match-define (rule _ arity f) r)
+  (define of (open-scopes f))
+  (let search ([rs rs])
+   (match rs
+     ['() #f]
+     [(cons (rule head arity* f*) rs)
+      (if (and (= arity arity*)
+               (formula-≡? of (open-scopes f*)))
+          head
+          (search rs))])))
 
 ;; Use graph isomorphism to determine identity. Can be optimized to do
 ;; lighter weight analysis before going to nauty.
@@ -135,9 +188,12 @@ p1(x) <- H(x),H(y) \/ F(z)
 
 ;; Formulae can be interned, and free names canonically chosen,
 ;; to speed up easy equivalence problems.
-(define (formula-≡? f0 f1)
+(define (formula-≡? f0 f1 [bound ∅])
   (or (equal? f0 f1)
-      (LDGs-isomorphic? (formula->LDG f0) (formula->LDG f1))))
+      (let ([f0* (lift-existentials f0 bound)]
+            [f1* (lift-existentials f1 bound)])
+        (or (equal? f0* f1*)
+            (LDGs-isomorphic? (formula->LDG f0*) (formula->LDG f1*))))))
 
 ;; Create the labeled, directed graph that we will compare for isomorphism
 (struct LDnode (label) #:mutable)
@@ -381,9 +437,11 @@ It's better to not blow graphs up a factor of 4, so I use directed graphs for no
       [`((,(? symbol? head) ,(? symbol? formal) ...) <- ,F)
        (define dup (check-duplicate formal))
        (when dup (error 'sexp->rule "Duplicate binder in rule: ~a" dup))
-       (rule head (for/fold ([s (sexp->formula F (apply seteq formal))])
-                      ([name (in-list formal)])
-                    (abstract-name name 0 s)))]))
+       (rule head
+             (length formal)
+             (for/fold ([s (sexp->formula F (apply seteq formal))])
+                 ([name (in-list formal)])
+               (abstract-name name s)))]))
 
   (check equal?
          ;; Rule (foo x y) <- (H x), (G y), (P y z)
@@ -399,11 +457,6 @@ It's better to not blow graphs up a factor of 4, so I use directed graphs for no
                                    (∃ (w) (P y z w))))
                             (seteq 'x 'y))
          (sexp->formula `(∃ (z w0 w1) (and (H x) (G y w0) (P y z w1))))))
-
-(define (fill-from! cv M start)
-  (for ([idx (in-range M)]
-        [n (in-naturals start)])
-    (cvector-set! cv idx n)))
 
 ;; G is an adjacency mapping.
 (define (adj->nauty-graph G num-vertices m)
