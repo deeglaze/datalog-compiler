@@ -1,0 +1,103 @@
+*** nauty25r9/nauty.h	2015-04-19 23:33:26.822036760 -0400
+--- nauty25r9b/nauty.h	2015-04-19 15:48:38.786469411 -0400
+***************
+*** 1165,1170 ****
+--- 1165,1172 ----
+  extern void naugraph_freedyn(void);
+  extern void densenauty(graph*,int*,int*,int*,
+  			optionblk*,statsblk*,int,int,graph*);
++ extern boolean dense_compare(graph*,graph*,int,int);
++ extern void liason(graph*,int*,int*,int*,int,int,graph*);
+  extern void writegroupsize(FILE*,double,int);
+  
+  #ifdef __cplusplus
+*** nauty25r9/nauty.c	2014-02-13 03:53:33.000000000 -0500
+--- nauty25r9b/nauty.c	2015-04-19 14:08:52.106017876 -0400
+***************
+*** 1169,1174 ****
+--- 1169,1193 ----
+  
+  /*****************************************************************************
+  *                                                                            *
++ *  dense_compare(g0,g1,m,n)                                                  *
++ *     compares two (canonical) graphs for structural equality                *
++ *                                                                            *
++ *****************************************************************************/
++ 
++ boolean
++ dense_compare(graph* g0, graph* g1, int m, int n) {
++   int idx = 0;
++   int max = m*n;
++   for (; idx < max; ++idx) {
++     if (g0[idx] != g1[idx])
++       return FALSE;
++   }
++   return TRUE;
++ }
++ 
++ 
++ /*****************************************************************************
++ *                                                                            *
+  *  nauty_freedyn() frees all the dynamic memory used in this module.         *
+  *                                                                            *
+  *****************************************************************************/
+*** nauty25r9/liason.c	1969-12-31 19:00:00.000000000 -0500
+--- nauty25r9b/liason.c	2015-04-19 16:06:20.694496690 -0400
+***************
+*** 0 ****
+--- 1,10 ----
++ #include "nauty.h"
++ #include "nautinv.h"
++ 
++ static DEFAULTOPTIONS_DIGRAPH(options);
++ statsblk stats;
++ 
++ void
++ liason(graph* g, int* lab, int* ptn, int* orbits, int m, int n, graph *canong){
++   densenauty(g,lab,ptn,orbits,&options,&stats,m,n,canong);
++ }
+*** nauty25r9/makefile.in	2013-05-10 00:26:46.000000000 -0400
+--- nauty25r9b/makefile.in	2015-04-19 23:45:44.526055710 -0400
+***************
+*** 163,168 ****
+--- 163,171 ----
+  gtoolsL.o : ${GTOOLSH} gtools.c
+  	${CCOBJ} ${L} gtools.c
+  
++ liason.o : liason.c
++ 	${CCOBJ} liason.c
++ 
+  nautaux.o: nautaux.h nauty.h naututil.h nautaux.c
+  	${CCOBJ} nautaux.c
+  nautauxS.o: nautaux.h nauty.h naututil.h nautaux.c
+***************
+*** 203,213 ****
+  	     nausparse.o schreier.o traces.o ${LDFLAGS}
+  
+  nauty.a: ${NAUTYO} traces.o gtools.o naututil.o nautinv.o \
+! 			gutil1.o gutil2.o gtnauty.o naugroup.o
+  	rm -rf nauty.a
+  	ar crs nauty.a ${NAUTYO} traces.o gtools.o naututil.o \
+  		 nautinv.o gutil1.o gutil2.o gtnauty.o naugroup.o \
+! 		 naurng.o schreier.o
+  
+  nauty1.a: ${NAUTY1O} traces.o gtools.o naututil1.o nautinv1.o \
+  	   gutil1.o gutil2.o gtnauty.o naugroup.o
+--- 206,222 ----
+  	     nausparse.o schreier.o traces.o ${LDFLAGS}
+  
+  nauty.a: ${NAUTYO} traces.o gtools.o naututil.o nautinv.o \
+! 			gutil1.o gutil2.o gtnauty.o naugroup.o liason.o
+  	rm -rf nauty.a
+  	ar crs nauty.a ${NAUTYO} traces.o gtools.o naututil.o \
+  		 nautinv.o gutil1.o gutil2.o gtnauty.o naugroup.o \
+! 		 naurng.o schreier.o liason.o
+! 
+! nauty.so: ${NAUTYO} traces.o gtools.o naututil.o nautinv.o \
+! 			gutil1.o gutil2.o gtnauty.o naugroup.o liason.o
+! 	rm -rf nauty.so
+! 	${CC} -shared -o nauty.so ${NAUTYO} traces.o gtools.o naututil.o nautinv.o \
+! 			gutil1.o gutil2.o gtnauty.o naugroup.o liason.o
+  
+  nauty1.a: ${NAUTY1O} traces.o gtools.o naututil1.o nautinv1.o \
+  	   gutil1.o gutil2.o gtnauty.o naugroup.o
